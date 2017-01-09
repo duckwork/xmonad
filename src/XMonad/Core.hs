@@ -26,7 +26,7 @@ module XMonad.Core (
     FLayer(..), FloatClass(..), FloatDec(..), noFloatDec,
     insertFDec, deleteByDec, newFDec, deleteByOrig, NoFloatDec(..), withFLayer,
     runX, catchX, userCode, userCodeDef, io, catchIO, installSignalHandlers, uninstallSignalHandlers,
-    withDisplay, withWindowSet,
+    withDisplay, withWindowSet, withWindowAttributes,
     isRoot, runOnWorkspaces, modifyFLayer,
     getAtom, spawn, spawnPID, xfork, getXMonadDir, recompile, trace, whenJust, whenX,
     atom_WM_STATE, atom_WM_PROTOCOLS, atom_WM_DELETE_WINDOW, atom_WM_TAKE_FOCUS, ManageHook, Query(..), runQuery
@@ -52,7 +52,7 @@ import System.Process
 import System.Directory
 import System.Exit
 import Graphics.X11.Xlib
-import Graphics.X11.Xlib.Extras (Event)
+import Graphics.X11.Xlib.Extras (getWindowAttributes, WindowAttributes, Event)
 import Data.Typeable
 import Data.List ((\\))
 import Data.Maybe (isJust,fromMaybe)
@@ -121,6 +121,8 @@ data XConfig l = XConfig
     , clickJustFocuses   :: !Bool                -- ^ False to make a click which changes focus to be additionally passed to the window
     , clientMask         :: !EventMask           -- ^ The client events that xmonad is interested in
     , rootMask           :: !EventMask           -- ^ The root events that xmonad is interested in
+      , handleExtraArgs    :: !([String] -> XConfig Layout -> IO (XConfig Layout)) 
+                                                 -- ^ Modify the configuration, complain about extra arguments etc. with arguments that are not handled by default
     }
 
 
@@ -181,7 +183,7 @@ runX c st (X a) = runStateT (runReaderT a c) st
 
 -- | Run in the 'X' monad, and in case of exception, and catch it and log it
 -- to stderr, and run the error case.
-{-# ANN catchX "HLint: ignore" #-}
+-- {-# ANN catchX "HLint: ignore" #-}
 catchX :: X a -> X a -> X a
 catchX job errcase = do
     st <- get
@@ -217,6 +219,12 @@ withFLayer f = gets floatingLayer >>= f
 withWindowSet :: (WindowSet -> X a) -> X a
 withWindowSet f = gets windowset >>= f
 
+-- | Safely access window attributes.
+withWindowAttributes :: Display -> Window -> (WindowAttributes -> X ()) -> X ()
+withWindowAttributes dpy win f = do
+    wa <- userCode (io $ getWindowAttributes dpy win)
+    catchX (whenJust wa f) (return ())
+
 -- | True if the given window is the root window
 isRoot :: Window -> X Bool
 isRoot w = (w==) <$> asks theRoot
@@ -227,13 +235,13 @@ getAtom str = withDisplay $ \dpy -> io $ internAtom dpy str False
 
 -- | Common non-predefined atoms
 atom_WM_PROTOCOLS, atom_WM_DELETE_WINDOW, atom_WM_STATE, atom_WM_TAKE_FOCUS :: X Atom
-{-# ANN atom_WM_PROTOCOLS "HLint: ignore" #-}
+-- {-# ANN atom_WM_PROTOCOLS "HLint: ignore" #-}
 atom_WM_PROTOCOLS       = getAtom "WM_PROTOCOLS"
-{-# ANN atom_WM_DELETE_WINDOW "HLint: ignore" #-}
+-- {-# ANN atom_WM_DELETE_WINDOW "HLint: ignore" #-}
 atom_WM_DELETE_WINDOW   = getAtom "WM_DELETE_WINDOW"
-{-# ANN atom_WM_STATE "HLint: ignore" #-}
+-- {-# ANN atom_WM_STATE "HLint: ignore" #-}
 atom_WM_STATE           = getAtom "WM_STATE"
-{-# ANN atom_WM_TAKE_FOCUS "HLint: ignore" #-}
+-- {-# ANN atom_WM_TAKE_FOCUS "HLint: ignore" #-}
 atom_WM_TAKE_FOCUS      = getAtom "WM_TAKE_FOCUS"
 
 ------------------------------------------------------------------------
@@ -416,7 +424,7 @@ catchIO f = io (f `E.catch` \(SomeException e) -> hPrint stderr e >> hFlush stde
 -- runs the 'String' you pass as a command to \/bin\/sh.
 --
 -- Note this function assumes your locale uses utf8.
-{-# ANN spawn "HLint: ignore" #-}
+-- {-# ANN spawn "HLint: ignore" #-}
 spawn :: MonadIO m => String -> m ()
 spawn x = spawnPID x >> return ()
 
@@ -478,16 +486,30 @@ recompile force = io $ do
         err  = base ++ ".errors"
         src  = base ++ ".hs"
         lib  = dir </> "lib"
+        buildscript = dir </> "build"
     libTs <- mapM getModTime . Prelude.filter isSource =<< allFiles lib
+    useBuildscript <- do
+        exists <- doesFileExist buildscript
+        if exists
+           then executable <$> getPermissions buildscript
+           else return False
     srcT <- getModTime src
     binT <- getModTime bin
-    if force || any (binT <) (srcT : libTs)
+    buildScriptT <- getModTime buildscript
+    let addBuildScriptT = if useBuildscript
+                            then (buildScriptT :)
+                            else id
+    if force || any (binT <) (addBuildScriptT $ srcT : libTs)
       then do
         -- temporarily disable SIGCHLD ignoring:
         uninstallSignalHandlers
-        status <- bracket (openFile err WriteMode) hClose $ \h ->
-            waitForProcess =<< runProcess "ghc" ["--make", "xmonad.hs", "-i", "-ilib", "-fforce-recomp", "-main-is", "main", "-v0", "-o",binn] (Just dir)
-                                    Nothing Nothing Nothing (Just h)
+        -- status <- bracket (openFile err WriteMode) hClose $ \h ->
+        --     waitForProcess =<< runProcess "ghc" ["--make", "xmonad.hs", "-i", "-ilib", "-fforce-recomp", "-main-is", "main", "-v0", "-o",binn] (Just dir)
+        --                             Nothing Nothing Nothing (Just h)
+        status <- bracket (openFile err WriteMode) hClose $ \errHandle ->
+            waitForProcess =<< if useBuildscript
+                                  then compileScript binn dir buildscript errHandle
+                                  else compileGHC binn dir errHandle
 
         -- re-enable SIGCHLD:
         installSignalHandlers
@@ -502,7 +524,7 @@ recompile force = io $ do
             -- nb, the ordering of printing, then forking, is crucial due to
             -- lazy evaluation
             hPutStrLn stderr msg
-            forkProcess $ executeFile "xmessage" True ["-default", "okay", msg] Nothing
+            forkProcess $ executeFile "xmessage" True ["-default", "okay", replaceUnicode msg] Nothing
             return ()
         return (status == ExitSuccess)
       else return True
@@ -513,6 +535,25 @@ recompile force = io $ do
             cs <- prep <$> E.catch (getDirectoryContents t) (\(SomeException _) -> return [])
             ds <- filterM doesDirectoryExist cs
             concat . ((cs \\ ds):) <$> mapM allFiles ds
+       replaceUnicode 
+          = map $ \c -> 
+              case c of
+                '\8226' -> '*' -- •
+                '\8216' -> '`' -- ‘
+                '\8217' -> '`' -- ’
+                _       -> c
+       compileGHC binn dir errHandle
+          = runProcess "ghc" ["--make"
+                                , "xmonad.hs"
+                                , "-i"
+                                , "-ilib"
+                                , "-fforce-recomp"
+                                , "-main-is", "main"
+                                , "-v0"
+                                , "-o", binn
+                                ] (Just dir) Nothing Nothing Nothing (Just errHandle)
+       compileScript binn dir script errHandle
+          = runProcess script [binn] (Just dir) Nothing Nothing Nothing (Just errHandle)
 
 -- | Conditionally run an action, using a @Maybe a@ to decide.
 whenJust :: Monad m => Maybe a -> (a -> m ()) -> m ()

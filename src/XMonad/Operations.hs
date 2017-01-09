@@ -34,6 +34,7 @@ import Control.Monad.Reader
 import Control.Monad.State
 import qualified Control.Exception.Extensible as C
 
+import System.IO
 import System.Posix.Process (executeFile)
 import Graphics.X11.Xlib
 import Graphics.X11.Xinerama (getScreenInfo)
@@ -91,7 +92,7 @@ killWindow w = withDisplay $ \d -> do
                 setEventType ev clientMessage
                 setClientMessageEvent ev w wmprot 32 wmdelt 0
                 sendEvent d w False noEventMask ev
-        else void $ killClient d w 
+        else killClient d w >> return ()
 
 -- | Kill the currently focused client.
 kill :: X ()
@@ -103,7 +104,7 @@ kill = withFocused killWindow
 -- | windows. Modify the current window list with a pure function, and refresh
 windows :: (WindowSet -> WindowSet) -> X ()
 windows f = do
-    old <- gets windowset
+    XState { windowset = old } <- get
     frf <- asks (focusRaisesFloat . config)
     let oldvisible = concatMap (W.integrate' . W.stack . W.workspace) $ W.current old : W.visible old
         newwindows = W.allWindows ws \\ W.allWindows old
@@ -117,7 +118,9 @@ windows f = do
 
     mapM_ setInitialProperties newwindows
 
-    whenJust (W.peek old) $ \otherw -> io $ setWindowBorder d otherw nbc
+    whenJust (W.peek old) $ \otherw -> do
+      nbs <- asks (normalBorderColor . config)
+      setWindowBorderWithFallback d otherw nbs nbc
 
     modify (\s -> s { windowset = ws })
 
@@ -152,7 +155,7 @@ windows f = do
         -- HERE BE THE DRAGONS
         let m   = W.floating ws
             flt = [(fw, scaleRationalRect viewrect r)
-                    | fw <- filter (`M.member` m) (W.index this)
+                    | fw <- filter (flip M.member m) (W.index this)
                     , Just r <- [M.lookup fw m]]
             vs = flt ++ rs
 
@@ -166,18 +169,21 @@ windows f = do
 
     mapM_ (uncurry tileWindow) rects
 
+    whenJust (W.peek ws) $ \w -> do
+      fbs <- asks (focusedBorderColor . config)
+      setWindowBorderWithFallback d w fbs fbc
+
     mapM_ reveal visible
     setTopFocus
 
     -- hide every window that was potentially visible before, but is not
     -- given a position by a layout now.
-    let hidden = nub (oldvisible ++ newwindows) \\ visible
-    mapM_ hide hidden
+    mapM_ hide (nub (oldvisible ++ newwindows) \\ visible)
 
     -- all windows that are no longer in the windowset are marked as
     -- withdrawn, it is important to do this after the above, otherwise 'hide'
     -- will overwrite withdrawnState with iconicState
-    mapM_ (`setWMState` withdrawnState) (W.allWindows old \\ W.allWindows ws)
+    mapM_ (flip setWMState withdrawnState) (W.allWindows old \\ W.allWindows ws)
 
     isMouseFocused <- asks mouseFocused
     unless isMouseFocused $ clearEvents enterWindowMask
@@ -194,6 +200,19 @@ setWMState :: Window -> Int -> X ()
 setWMState w v = withDisplay $ \dpy -> do
     a <- atom_WM_STATE
     io $ changeProperty32 dpy w a a propModeReplace [fromIntegral v, fromIntegral none]
+
+-- | Set the border color using the window's color map, if possible,
+-- otherwise use fallback
+setWindowBorderWithFallback :: Display -> Window -> String -> Pixel -> X ()
+setWindowBorderWithFallback dpy w color basic = io $
+    C.handle fallback $ do
+      wa <- getWindowAttributes dpy w
+      pixel <- color_pixel . fst <$> allocNamedColor dpy (wa_colormap wa) color
+      setWindowBorder dpy w pixel
+    where
+      fallback :: C.SomeException -> IO ()
+      fallback e = do hPrint stderr e >> hFlush stderr
+                      setWindowBorder dpy w basic
 
 -- | hide. Hide a window by unmapping it, and setting Iconified.
 hide :: Window -> X ()
@@ -248,10 +267,10 @@ clearEvents mask = withDisplay $ \d -> io $ do
 -- | tileWindow. Moves and resizes w such that it fits inside the given
 -- rectangle, including its border.
 tileWindow :: Window -> Rectangle -> X ()
-tileWindow w r = withDisplay $ \d -> do
-    bw <- (fromIntegral . wa_border_width) <$> io (getWindowAttributes d w)
+tileWindow w r = withDisplay $ \d -> withWindowAttributes d w $ \wa -> do
     -- give all windows at least 1x1 pixels
-    let least x | x <= bw*2  = 1
+    let bw = fromIntegral $ wa_border_width wa
+        least x | x <= bw*2  = 1
                 | otherwise  = x - bw*2
     io $ moveResizeWindow d w (rect_x r) (rect_y r)
                               (least $ rect_width r) (least $ rect_height r)
@@ -453,7 +472,7 @@ restart prog resume = do
         maybeShow (t, Right (PersistentExtension ext)) = Just (t, show ext)
         maybeShow (t, Left str) = Just (t, str)
         maybeShow _ = Nothing
-        extState = return . show . mapMaybe maybeShow . M.toList . extensibleState
+        extState = return . show . catMaybes . map maybeShow . M.toList . extensibleState
     args <- if resume then gets (\s -> "--resume":wsData s:extState s) else return []
     catchIO (executeFile prog True args Nothing)
 
@@ -463,20 +482,27 @@ restart prog resume = do
 -- | Given a window, find the screen it is located on, and compute
 -- the geometry of that window wrt. that screen.
 floatLocation :: Window -> X (ScreenId, W.RationalRect)
-floatLocation w = withDisplay $ \d -> do
-    ws <- gets windowset
-    wa <- io $ getWindowAttributes d w
-    let bw = (fromIntegral . wa_border_width) wa
-    sc <- fromMaybe (W.current ws) <$> pointScreen (fi $ wa_x wa) (fi $ wa_y wa)
+floatLocation w =
+    catchX go $ do
+      -- Fallback solution if `go' fails.  Which it might, since it
+      -- calls `getWindowAttributes'.
+      sc <- W.current <$> gets windowset
+      return (W.screen sc, W.RationalRect 0 0 1 1)
 
-    let sr = screenRect . W.screenDetail $ sc
-        rr = W.RationalRect ((fi (wa_x wa) - fi (rect_x sr)) % fi (rect_width sr))
-                            ((fi (wa_y wa) - fi (rect_y sr)) % fi (rect_height sr))
-                            (fi (wa_width  wa + bw*2) % fi (rect_width sr))
-                            (fi (wa_height wa + bw*2) % fi (rect_height sr))
+  where fi x = fromIntegral x
+        go = withDisplay $ \d -> do
+          ws <- gets windowset
+          wa <- io $ getWindowAttributes d w
+          let bw = (fromIntegral . wa_border_width) wa
+          sc <- fromMaybe (W.current ws) <$> pointScreen (fi $ wa_x wa) (fi $ wa_y wa)
 
-    return (W.screen sc, rr)
-    where fi x = fromIntegral x
+          let sr = screenRect . W.screenDetail $ sc
+              rr = W.RationalRect ((fi (wa_x wa) - fi (rect_x sr)) % fi (rect_width sr))
+                                  ((fi (wa_y wa) - fi (rect_y sr)) % fi (rect_height sr))
+                                  (fi (wa_width  wa + bw*2) % fi (rect_width sr))
+                                  (fi (wa_height wa + bw*2) % fi (rect_height sr))
+
+          return (W.screen sc, rr)
 
 -- | Given a point, determine the screen (if any) that contains it.
 pointScreen :: Position -> Position
@@ -527,36 +553,34 @@ mouseDrag f done = do
                     clearEvents pointerMotionMask
                     return z
 
--- | XXX comment me
+-- | drag the window under the cursor with the mouse while it is dragged
 mouseMoveWindow :: Window -> X ()
 mouseMoveWindow w = whenX (isClient w) $ withDisplay $ \d -> do
     io $ raiseWindow d w
-    (WindowAttributes wax way waw wah wabw _ _ _ _)<- io $ getWindowAttributes d w
+    wa <- io $ getWindowAttributes d w
     (_, _, _, ox', oy', _, _, _) <- io $ queryPointer d w
     let ox = fromIntegral ox'
         oy = fromIntegral oy'
     startDraggingDec w
     dragHandler <- whileDraggingDec w
-    mouseDrag (\ex ey -> let nx = fromIntegral wax + fromIntegral (ex - ox)
-                             ny = fromIntegral way + fromIntegral (ey - oy)
+    mouseDrag (\ex ey -> let nx = fromIntegral (wa_x wa) + fromIntegral (ex - ox)
+                             ny = fromIntegral (wa_y wa) + fromIntegral (ey - oy)
                              r = Rectangle nx ny 
-                                (fromIntegral (waw + 2 * wabw)) (fromIntegral wah)
+                                (fromIntegral ((wa_width wa) + 2 * (wa_border_width wa))) (fromIntegral (wa_height wa))
                          in io (moveWindow d w nx ny) >> dragHandler r)
               (float w >> finishDraggingDec w)
 
--- | XXX comment me
+-- | resize the window under the cursor with the mouse while it is dragged
 mouseResizeWindow :: Window -> X ()
 mouseResizeWindow w = whenX (isClient w) $ withDisplay $ \d -> do
     io $ raiseWindow d w
-    (WindowAttributes wax way waw wah wabw _ _ _ _)<- io $ getWindowAttributes d w
+    wa <- io $ getWindowAttributes d w
     sh <- io $ getWMNormalHints d w
-    io $ warpPointer d none w 0 0 0 0 (fromIntegral waw) (fromIntegral wah)
+    io $ warpPointer d none w 0 0 0 0 (fromIntegral (wa_width wa)) (fromIntegral (wa_height wa))
     startDraggingDec w
     dragHandler <- whileDraggingDec w
-    mouseDrag (\ex ey -> let (nw, nh) = applySizeHintsContents sh (ex - fromIntegral wax,
-                                                                   ey - fromIntegral way)
-                             r = Rectangle (fromIntegral wax) (fromIntegral way) 
-                                           (nw + fromIntegral (2 * wabw)) nh
+    mouseDrag (\ex ey -> let (nw, nh) = applySizeHintsContents sh (ex - fromIntegral (wa_x wa), ey - fromIntegral (wa_y wa))
+                             r = Rectangle (fromIntegral (wa_x wa)) (fromIntegral (wa_y wa)) (nw + fromIntegral (2 * (wa_border_width wa))) nh
                          in io (resizeWindow d w nw nh) >> dragHandler r)
               (float w >> finishDraggingDec w)
 
