@@ -28,11 +28,11 @@ module XMonad.Config (defaultConfig, Default(..)) where
 import XMonad.Core as XMonad hiding
     (workspaces,manageHook,keys,logHook,startupHook,borderWidth,mouseBindings
     ,layoutHook,modMask,terminal,normalBorderColor,focusedBorderColor,focusFollowsMouse
-    ,handleEventHook,clickJustFocuses,rootMask,clientMask)
+    ,handleEventHook,clickJustFocuses,focusRaisesFloat,floatFocusFollowsMouse,clientMask,rootMask)
 import qualified XMonad.Core as XMonad
     (workspaces,manageHook,keys,logHook,startupHook,borderWidth,mouseBindings
     ,layoutHook,modMask,terminal,normalBorderColor,focusedBorderColor,focusFollowsMouse
-    ,handleEventHook,clickJustFocuses,rootMask,clientMask)
+    ,handleEventHook,clickJustFocuses,focusRaisesFloat,floatFocusFollowsMouse,clientMask,rootMask)
 
 import XMonad.Layout
 import XMonad.Operations
@@ -147,6 +147,9 @@ layout = tiled ||| Mirror tiled ||| Full
      -- Percent of screen to increment by when resizing panes
      delta   = 3/100
 
+-- |  the decorations applied o floating windows
+floatDecorator :: FloatDec Window
+floatDecorator = noFloatDec
 ------------------------------------------------------------------------
 -- Event Masks:
 
@@ -171,6 +174,14 @@ terminal = "xterm"
 -- | Whether focus follows the mouse pointer.
 focusFollowsMouse :: Bool
 focusFollowsMouse = True
+
+-- | Whether focus follows the mouse pointer for floating windows
+floatFocusFollowsMouse :: Bool
+floatFocusFollowsMouse = False
+
+-- | Whether clicking a floating window raises it
+focusRaisesFloat :: Bool
+focusRaisesFloat = True
 
 -- | Whether a mouse click select the focus or is just passed to the window
 clickJustFocuses :: Bool
@@ -218,7 +229,7 @@ keys conf@(XConfig {XMonad.modMask = modMask}) = M.fromList $
     , ((modMask              , xK_period), sendMessage (IncMasterN (-1))) -- %! Deincrement the number of windows in the master area
 
     -- quit, or restart
-    , ((modMask .|. shiftMask, xK_q     ), io (exitWith ExitSuccess)) -- %! Quit xmonad
+    , ((modMask .|. shiftMask, xK_q     ), io exitSuccess) -- %! Quit xmonad
     , ((modMask              , xK_q     ), spawn "if type xmonad; then xmonad --recompile && xmonad --restart; else xmessage xmonad not in \\$PATH: \"$PATH\"; fi") -- %! Restart xmonad
 
     , ((modMask .|. shiftMask, xK_slash ), spawn ("echo \"" ++ help ++ "\" | xmessage -file -")) -- %! Run xmessage with a summary of the default keybindings (useful for beginners)
@@ -254,26 +265,26 @@ mouseBindings (XConfig {XMonad.modMask = modMask}) = M.fromList
 
 instance (a ~ Choose Tall (Choose (Mirror Tall) Full)) => Default (XConfig a) where
   def = XConfig
-    { XMonad.borderWidth        = borderWidth
-    , XMonad.workspaces         = workspaces
-    , XMonad.layoutHook         = layout
-    , XMonad.terminal           = terminal
-    , XMonad.normalBorderColor  = normalBorderColor
-    , XMonad.focusedBorderColor = focusedBorderColor
-    , XMonad.modMask            = defaultModMask
-    , XMonad.keys               = keys
-    , XMonad.logHook            = logHook
-    , XMonad.startupHook        = startupHook
-    , XMonad.mouseBindings      = mouseBindings
-    , XMonad.manageHook         = manageHook
-    , XMonad.handleEventHook    = handleEventHook
-    , XMonad.focusFollowsMouse  = focusFollowsMouse
+    { XMonad.borderWidth            = borderWidth
+    , XMonad.workspaces             = workspaces
+    , XMonad.layoutHook             = layout
+    , XMonad.floatHook              = floatDecorator
+    , XMonad.terminal               = terminal
+    , XMonad.normalBorderColor      = normalBorderColor
+    , XMonad.focusedBorderColor     = focusedBorderColor
+    , XMonad.modMask                = defaultModMask
+    , XMonad.keys                   = keys
+    , XMonad.logHook                = logHook
+    , XMonad.startupHook            = startupHook
+    , XMonad.mouseBindings          = mouseBindings
+    , XMonad.manageHook             = manageHook
+    , XMonad.handleEventHook        = handleEventHook
+    , XMonad.focusFollowsMouse      = focusFollowsMouse
+    , XMonad.floatFocusFollowsMouse = floatFocusFollowsMouse
     , XMonad.clickJustFocuses       = clickJustFocuses
-    , XMonad.clientMask         = clientMask
-    , XMonad.rootMask           = rootMask
-    , XMonad.handleExtraArgs = \ xs theConf -> case xs of
-                [] -> return theConf
-                _ -> fail ("unrecognized flags:" ++ show xs)
+    , XMonad.focusRaisesFloat       = focusRaisesFloat
+    , XMonad.clientMask             = clientMask
+    , XMonad.rootMask               = rootMask
     }
 
 -- | The default set of configuration values itself
@@ -320,9 +331,9 @@ help = unlines ["The default modifier key is 'alt'. Default keybindings:",
     "-- quit, or restart",
     "mod-Shift-q  Quit xmonad",
     "mod-q        Restart xmonad",
+    "mod-[1..9]   Switch to workSpace N",
     "",
     "-- Workspaces & screens",
-    "mod-[1..9]         Switch to workSpace N",
     "mod-Shift-[1..9]   Move client to workspace N",
     "mod-{w,e,r}        Switch to physical/Xinerama screens 1, 2, or 3",
     "mod-Shift-{w,e,r}  Move client to screen 1, 2, or 3",

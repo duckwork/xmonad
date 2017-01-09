@@ -34,7 +34,6 @@ import Control.Monad.Reader
 import Control.Monad.State
 import qualified Control.Exception.Extensible as C
 
-import System.IO
 import System.Posix.Process (executeFile)
 import Graphics.X11.Xlib
 import Graphics.X11.Xinerama (getScreenInfo)
@@ -53,7 +52,7 @@ manage :: Window -> X ()
 manage w = whenX (not <$> isClient w) $ withDisplay $ \d -> do
     sh <- io $ getWMNormalHints d w
 
-    let isFixedSize = sh_min_size sh /= Nothing && sh_min_size sh == sh_max_size sh
+    let isFixedSize = isJust (sh_min_size sh) && sh_min_size sh == sh_max_size sh
     isTransient <- isJust <$> io (getTransientForHint d w)
 
     rr <- snd `fmap` floatLocation w
@@ -92,7 +91,7 @@ killWindow w = withDisplay $ \d -> do
                 setEventType ev clientMessage
                 setClientMessageEvent ev w wmprot 32 wmdelt 0
                 sendEvent d w False noEventMask ev
-        else killClient d w >> return ()
+        else void $ killClient d w 
 
 -- | Kill the currently focused client.
 kill :: X ()
@@ -104,19 +103,28 @@ kill = withFocused killWindow
 -- | windows. Modify the current window list with a pure function, and refresh
 windows :: (WindowSet -> WindowSet) -> X ()
 windows f = do
-    XState { windowset = old } <- get
+    old <- gets windowset
+    frf <- asks (focusRaisesFloat . config)
     let oldvisible = concatMap (W.integrate' . W.stack . W.workspace) $ W.current old : W.visible old
         newwindows = W.allWindows ws \\ W.allWindows old
-        ws = f old
+        oldFloats = M.keys $ M.difference (W.floating old) (W.floating ws)
+        mws = f old
+        ws = if frf && maybe False (\fw -> M.member fw (W.floating mws)) (W.peek mws)
+                then W.shiftMaster mws
+                else mws
+    mapM_ removeFloatDec oldFloats
     XConf { display = d , normalBorder = nbc, focusedBorder = fbc } <- ask
 
     mapM_ setInitialProperties newwindows
 
-    whenJust (W.peek old) $ \otherw -> do
-      nbs <- asks (normalBorderColor . config)
-      setWindowBorderWithFallback d otherw nbs nbc
+    whenJust (W.peek old) $ \otherw -> io $ setWindowBorder d otherw nbc
 
     modify (\s -> s { windowset = ws })
+
+    {-whenJust (W.peek ws) $ \ffw -> -}
+        {-when (M.member ffw (W.floating ws) && frf) $ do -}
+            {-io $ raiseWindow d ffw-}
+            {-modify (\s -> s { windowset = W.shiftMaster ws })-}
 
     -- notify non visibility
     let tags_oldvisible = map (W.tag . W.workspace) $ W.current old : W.visible old
@@ -141,13 +149,16 @@ windows f = do
                      runLayout wsp { W.stack = tiled, W.layout = Layout Full } viewrect
         updateLayout n ml'
 
+        -- HERE BE THE DRAGONS
         let m   = W.floating ws
             flt = [(fw, scaleRationalRect viewrect r)
-                    | fw <- filter (flip M.member m) (W.index this)
+                    | fw <- filter (`M.member` m) (W.index this)
                     , Just r <- [M.lookup fw m]]
             vs = flt ++ rs
 
-        io $ restackWindows d (map fst vs)
+        mapM_ (showFloatDec . fst) flt
+        fl <- gets floatingLayer
+        io $ restackWindows d (concatMap (stackDec fl . fst) vs)
         -- return the visible windows for this workspace:
         return vs
 
@@ -155,21 +166,18 @@ windows f = do
 
     mapM_ (uncurry tileWindow) rects
 
-    whenJust (W.peek ws) $ \w -> do
-      fbs <- asks (focusedBorderColor . config)
-      setWindowBorderWithFallback d w fbs fbc
-
     mapM_ reveal visible
     setTopFocus
 
     -- hide every window that was potentially visible before, but is not
     -- given a position by a layout now.
-    mapM_ hide (nub (oldvisible ++ newwindows) \\ visible)
+    let hidden = nub (oldvisible ++ newwindows) \\ visible
+    mapM_ hide hidden
 
     -- all windows that are no longer in the windowset are marked as
     -- withdrawn, it is important to do this after the above, otherwise 'hide'
     -- will overwrite withdrawnState with iconicState
-    mapM_ (flip setWMState withdrawnState) (W.allWindows old \\ W.allWindows ws)
+    mapM_ (`setWMState` withdrawnState) (W.allWindows old \\ W.allWindows ws)
 
     isMouseFocused <- asks mouseFocused
     unless isMouseFocused $ clearEvents enterWindowMask
@@ -187,22 +195,10 @@ setWMState w v = withDisplay $ \dpy -> do
     a <- atom_WM_STATE
     io $ changeProperty32 dpy w a a propModeReplace [fromIntegral v, fromIntegral none]
 
--- | Set the border color using the window's color map, if possible,
--- otherwise use fallback.
-setWindowBorderWithFallback :: Display -> Window -> String -> Pixel -> X ()
-setWindowBorderWithFallback dpy w color basic = io $
-    C.handle fallback $ do
-      wa <- getWindowAttributes dpy w
-      pixel <- color_pixel . fst <$> allocNamedColor dpy (wa_colormap wa) color
-      setWindowBorder dpy w pixel
-  where
-    fallback :: C.SomeException -> IO ()
-    fallback e = do hPrint stderr e >> hFlush stderr
-                    setWindowBorder dpy w basic
-
 -- | hide. Hide a window by unmapping it, and setting Iconified.
 hide :: Window -> X ()
 hide w = whenX (gets (S.member w . mapped)) $ withDisplay $ \d -> do
+    hideFloatDec w
     cMask <- asks $ clientMask . config
     io $ do selectInput d w (cMask .&. complement structureNotifyMask)
             unmapWindow d w
@@ -252,10 +248,10 @@ clearEvents mask = withDisplay $ \d -> io $ do
 -- | tileWindow. Moves and resizes w such that it fits inside the given
 -- rectangle, including its border.
 tileWindow :: Window -> Rectangle -> X ()
-tileWindow w r = withDisplay $ \d -> withWindowAttributes d w $ \wa -> do
+tileWindow w r = withDisplay $ \d -> do
+    bw <- (fromIntegral . wa_border_width) <$> io (getWindowAttributes d w)
     -- give all windows at least 1x1 pixels
-    let bw = fromIntegral $ wa_border_width wa
-        least x | x <= bw*2  = 1
+    let least x | x <= bw*2  = 1
                 | otherwise  = x - bw*2
     io $ moveResizeWindow d w (rect_x r) (rect_y r)
                               (least $ rect_width r) (least $ rect_height r)
@@ -326,6 +322,9 @@ focus w = local (\c -> c { mouseFocused = True }) $ withWindowSet $ \s -> do
     mnew <- maybe (return Nothing) (fmap (fmap stag) . uncurry pointScreen)
             =<< asks mousePosition
     root <- asks theRoot
+    {-frf <- asks (focusRaisesFloat . config)-}
+    {-when (frf && M.member w (W.floating s)) $-}
+        {-withDisplay $ \d -> io $ raiseWindow d w-}
     case () of
         _ | W.member w s && W.peek s /= Just w -> windows (W.focusWindow w)
           | Just new <- mnew, w == root && curr /= new
@@ -352,15 +351,15 @@ setFocusX w = withWindowSet $ \ws -> do
     currevt <- asks currentEvent
     let inputHintSet = wmh_flags hints `testBit` inputHintBit
 
-    when ((inputHintSet && wmh_input hints) || (not inputHintSet)) $
-      io $ do setInputFocus dpy w revertToPointerRoot 0
+    when ((inputHintSet && wmh_input hints) || not inputHintSet) $
+      io $ setInputFocus dpy w revertToPointerRoot 0
     when (wmtf `elem` protocols) $
       io $ allocaXEvent $ \ev -> do
         setEventType ev clientMessage
         setClientMessageEvent ev w wmprot 32 wmtf $ maybe currentTime event_time currevt
         sendEvent dpy w False noEventMask ev
         where event_time ev =
-                if (ev_event_type ev) `elem` timedEvents then
+                if ev_event_type ev `elem` timedEvents then
                   ev_time ev
                 else
                   currentTime
@@ -387,6 +386,7 @@ broadcastMessage a = withWindowSet $ \ws -> do
        v = map W.workspace . W.visible $ ws
        h = W.hidden ws
    mapM_ (sendMessageWithNoRefresh a) (c : v ++ h)
+   sendMessageToFloat a
 
 -- | Send a message to a layout, without refreshing.
 sendMessageWithNoRefresh :: Message a => a -> W.Workspace WorkspaceId (Layout Window) Window -> X ()
@@ -453,7 +453,7 @@ restart prog resume = do
         maybeShow (t, Right (PersistentExtension ext)) = Just (t, show ext)
         maybeShow (t, Left str) = Just (t, str)
         maybeShow _ = Nothing
-        extState = return . show . catMaybes . map maybeShow . M.toList . extensibleState
+        extState = return . show . mapMaybe maybeShow . M.toList . extensibleState
     args <- if resume then gets (\s -> "--resume":wsData s:extState s) else return []
     catchIO (executeFile prog True args Nothing)
 
@@ -463,27 +463,20 @@ restart prog resume = do
 -- | Given a window, find the screen it is located on, and compute
 -- the geometry of that window wrt. that screen.
 floatLocation :: Window -> X (ScreenId, W.RationalRect)
-floatLocation w =
-    catchX go $ do
-      -- Fallback solution if `go' fails.  Which it might, since it
-      -- calls `getWindowAttributes'.
-      sc <- W.current <$> gets windowset
-      return (W.screen sc, W.RationalRect 0 0 1 1)
+floatLocation w = withDisplay $ \d -> do
+    ws <- gets windowset
+    wa <- io $ getWindowAttributes d w
+    let bw = (fromIntegral . wa_border_width) wa
+    sc <- fromMaybe (W.current ws) <$> pointScreen (fi $ wa_x wa) (fi $ wa_y wa)
 
-  where fi x = fromIntegral x
-        go = withDisplay $ \d -> do
-          ws <- gets windowset
-          wa <- io $ getWindowAttributes d w
-          let bw = (fromIntegral . wa_border_width) wa
-          sc <- fromMaybe (W.current ws) <$> pointScreen (fi $ wa_x wa) (fi $ wa_y wa)
+    let sr = screenRect . W.screenDetail $ sc
+        rr = W.RationalRect ((fi (wa_x wa) - fi (rect_x sr)) % fi (rect_width sr))
+                            ((fi (wa_y wa) - fi (rect_y sr)) % fi (rect_height sr))
+                            (fi (wa_width  wa + bw*2) % fi (rect_width sr))
+                            (fi (wa_height wa + bw*2) % fi (rect_height sr))
 
-          let sr = screenRect . W.screenDetail $ sc
-              rr = W.RationalRect ((fi (wa_x wa) - fi (rect_x sr)) % fi (rect_width sr))
-                                  ((fi (wa_y wa) - fi (rect_y sr)) % fi (rect_height sr))
-                                  (fi (wa_width  wa + bw*2) % fi (rect_width sr))
-                                  (fi (wa_height wa + bw*2) % fi (rect_height sr))
-
-          return (W.screen sc, rr)
+    return (W.screen sc, rr)
+    where fi x = fromIntegral x
 
 -- | Given a point, determine the screen (if any) that contains it.
 pointScreen :: Position -> Position
@@ -510,6 +503,7 @@ float w = do
         sw <- W.lookupWorkspace sc ws
         return (W.focusWindow f . W.shiftWin sw w $ ws)
 
+
 -- ---------------------------------------------------------------------
 -- Mouse handling
 
@@ -533,30 +527,38 @@ mouseDrag f done = do
                     clearEvents pointerMotionMask
                     return z
 
--- | drag the window under the cursor with the mouse while it is dragged
+-- | XXX comment me
 mouseMoveWindow :: Window -> X ()
 mouseMoveWindow w = whenX (isClient w) $ withDisplay $ \d -> do
     io $ raiseWindow d w
-    wa <- io $ getWindowAttributes d w
+    (WindowAttributes wax way waw wah wabw _ _ _ _)<- io $ getWindowAttributes d w
     (_, _, _, ox', oy', _, _, _) <- io $ queryPointer d w
     let ox = fromIntegral ox'
         oy = fromIntegral oy'
-    mouseDrag (\ex ey -> io $ moveWindow d w (fromIntegral (fromIntegral (wa_x wa) + (ex - ox)))
-                                             (fromIntegral (fromIntegral (wa_y wa) + (ey - oy))))
-              (float w)
+    startDraggingDec w
+    dragHandler <- whileDraggingDec w
+    mouseDrag (\ex ey -> let nx = fromIntegral wax + fromIntegral (ex - ox)
+                             ny = fromIntegral way + fromIntegral (ey - oy)
+                             r = Rectangle nx ny 
+                                (fromIntegral (waw + 2 * wabw)) (fromIntegral wah)
+                         in io (moveWindow d w nx ny) >> dragHandler r)
+              (float w >> finishDraggingDec w)
 
--- | resize the window under the cursor with the mouse while it is dragged
+-- | XXX comment me
 mouseResizeWindow :: Window -> X ()
 mouseResizeWindow w = whenX (isClient w) $ withDisplay $ \d -> do
     io $ raiseWindow d w
-    wa <- io $ getWindowAttributes d w
+    (WindowAttributes wax way waw wah wabw _ _ _ _)<- io $ getWindowAttributes d w
     sh <- io $ getWMNormalHints d w
-    io $ warpPointer d none w 0 0 0 0 (fromIntegral (wa_width wa)) (fromIntegral (wa_height wa))
-    mouseDrag (\ex ey ->
-                 io $ resizeWindow d w `uncurry`
-                    applySizeHintsContents sh (ex - fromIntegral (wa_x wa),
-                                               ey - fromIntegral (wa_y wa)))
-              (float w)
+    io $ warpPointer d none w 0 0 0 0 (fromIntegral waw) (fromIntegral wah)
+    startDraggingDec w
+    dragHandler <- whileDraggingDec w
+    mouseDrag (\ex ey -> let (nw, nh) = applySizeHintsContents sh (ex - fromIntegral wax,
+                                                                   ey - fromIntegral way)
+                             r = Rectangle (fromIntegral wax) (fromIntegral way) 
+                                           (nw + fromIntegral (2 * wabw)) nh
+                         in io (resizeWindow d w nw nh) >> dragHandler r)
+              (float w >> finishDraggingDec w)
 
 -- ---------------------------------------------------------------------
 -- | Support for window size hints
@@ -568,7 +570,7 @@ type D = (Dimension, Dimension)
 mkAdjust :: Window -> X (D -> D)
 mkAdjust w = withDisplay $ \d -> liftIO $ do
     sh <- getWMNormalHints d w
-    bw <- fmap (fromIntegral . wa_border_width) $ getWindowAttributes d w
+    bw <- (fromIntegral . wa_border_width) <$> getWindowAttributes d w
     return $ applySizeHints bw sh
 
 -- | Reduce the dimensions if needed to comply to the given SizeHints, taking
@@ -610,3 +612,91 @@ applyResizeIncHint (iw,ih) x@(w,h) =
 applyMaxSizeHint  :: D -> D -> D
 applyMaxSizeHint (mw,mh) x@(w,h) =
     if mw > 0 && mh > 0 then (min w mw,min h mh) else x
+
+--------------------------------------------------------------
+-- Floating Shenanigans 
+-------------------------------------------------------------
+
+-- | Raise float window and make the master
+{-raiseFloat :: Window -> X ()-}
+{-raiseFloat w = withWindowSet $ \ws -> -}
+    {-when (M.member w (W.floating ws) && w /= head (W.index ws)) $-}
+        {-windows $ W.shiftMaster  . W.focusWindow w-}
+
+-- | If the window is decorated, hide it's decoration
+hideFloatDec :: Window -> X ()
+hideFloatDec = withDec' $ \fd ow dw -> do
+    withDisplay $ \d -> io $ unmapWindow d dw
+    hideFDec fd ow dw 
+
+-- | Send a message to the floating layer
+sendMessageToFloat :: Message a => a -> X ()
+sendMessageToFloat a = withFLayer $ \(FLayer _ _ fd) -> do
+    mfd <- handleFloatMessage fd (SomeMessage a)
+    modifyFLayer (newFDec mfd)
+
+-- | If a window is decorated, prepare it's decoration for dragging
+startDraggingDec :: Window -> X ()
+startDraggingDec = withDec' startDecDrag
+
+-- | If a window is decorated, alert the decortation that the dragging has ended
+finishDraggingDec :: Window -> X ()
+finishDraggingDec = withDec' finishDecDrag 
+
+-- | If a window is decorated allow the decoration to respond to the new position
+whileDraggingDec :: Window -> X (Rectangle -> X ())
+whileDraggingDec ow = withFLayer $ \(FLayer fws _ fd) -> case M.lookup ow fws of
+    Just (Just dw) -> whileDecDrag fd ow dw
+    otherwise      -> return $ \_ -> return ()
+
+-- | If a window is decorated, destroy the decoration
+removeFloatDec :: Window -> X ()
+removeFloatDec ow = do withDec ow (\fd dw -> do
+                            nfd <- removeFDec fd ow dw
+                            withDisplay $ \d -> io $ destroyWindow d dw
+                            modifyFLayer $ newFDec nfd)
+                       modifyFLayer $ deleteByOrig ow
+
+-- | Reorder the floating windows such that their decorations are paired with 
+-- their parents
+stackDec :: Ord a => FLayer a -> a -> [a]
+stackDec (FLayer fws _ _) w = case M.lookup w fws of
+    Just (Just dw) -> [dw, w]
+    otherwise -> [w]
+
+-- | Show the decoration for the given floating window or create it if necessary
+showFloatDec :: Window -> X ()
+showFloatDec w = withFLayer $ \(FLayer fws _ fd) ->
+    case M.lookup w fws of
+        --Decration exists, and may need to be modified
+        Just (Just dw) -> do
+            reveal dw
+            nfd <- moveFDec fd w dw
+            modifyFLayer (newFDec nfd)
+        --The window was just added to the floating layer
+        --Create a the corresponding decoration
+        Nothing -> do 
+            (mw, mfd) <- createFDec fd w 
+            modifyFLayer (newFDec mfd . insertFDec w mw)
+        --The window should not be decorated
+        otherwise -> return ()
+
+-- | a convience wrapper that takes a applies the given function to a the
+-- floating window in it's context and adjusts the Floating Layer in accordance
+withDec' :: (FloatDec Window -> Window -> Window -> X (Maybe (FloatDec Window))) 
+                                                              -> Window -> X ()
+withDec' wf ow = withFLayer $ \(FLayer fws _ fl) -> case M.lookup ow fws of
+    Just (Just dw) -> wf fl ow dw >>= \nfd -> modifyFLayer $ newFDec nfd
+    otherwise -> return ()
+
+-- | if the given window is decorated, apply the given function to it's decorated context
+withDec :: Window -> (FloatDec Window -> Window -> X ()) -> X () 
+withDec ow f = withFLayer $ \(FLayer fws _ fl) -> case M.lookup ow fws of
+    Just (Just dw) -> f fl dw
+    otherwise -> return ()
+
+-- | If the given window is a decoration, apply the given function to it's parent window
+whenDec :: Window -> (Window -> X ()) -> X ()
+whenDec dw f = withFLayer $ \(FLayer _ dws _) -> case M.lookup dw dws of
+    Just ow -> f ow
+    otherwise -> return ()
